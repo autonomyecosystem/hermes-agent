@@ -144,12 +144,14 @@ RUN set -eu; \
 # tini CLI surface, then exec's /init + main-wrapper — see
 # docker/tini-shim.sh. Safe to drop once the affected catalogs are
 # updated.
-COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
+COPY docker/tini-shim.sh /usr/bin/tini
+RUN chmod 0755 /usr/bin/tini
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
 
-COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/uv /usr/local/bin/uvx
 
 # Node 26: copy the node binary plus the bundled npm JS install from the
 # upstream image.  npm and npx are recreated as symlinks because they're
@@ -161,7 +163,8 @@ COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/loc
 #
 # See node_source stage at the top of the file for the version-bump
 # rationale (#4977).
-COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
+COPY --from=node_source /usr/local/bin/node /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/node
 COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
@@ -195,8 +198,20 @@ COPY apps/shared/ apps/shared/
 # runtime `npm install` that then failed with EACCES.  Keeping the env
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
+# patch locale: registry.npmjs.org non raggiungibile dalla rete del PC ->
+# mirror npmmirror per npm e binari playwright (rimozione --chmod gia' applicata)
+ENV npm_config_registry=https://registry.npmmirror.com
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+# patch locale rete instabile: max 6 tentativi npm install, maxsockets basso,
+# timeout generosi; npm e' idempotente quindi ogni retry riprende dal parziale
+RUN tries=0; \
+    while ! npm install --prefer-offline --no-audit --fetch-retries=5 \
+        --fetch-timeout=180000 --fetch-retry-mintimeout=15000 \
+        --fetch-retry-maxtimeout=90000 --maxsockets=4; do \
+      tries=$((tries+1)); \
+      { [ "$tries" -ge 6 ] && exit 1; echo "npm install failed (attempt $tries); retrying in 20s"; sleep 20; }; \
+    done && \
     for i in 1 2 3; do \
         npx playwright install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
@@ -216,7 +231,13 @@ COPY plugins/platforms/photon/sidecar/package.json \
      plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs \
      plugins/platforms/photon/sidecar/
 RUN cd plugins/platforms/photon/sidecar && \
-    npm ci --no-audit --fetch-retries=5 && \
+    tries=0; \
+    while ! npm ci --no-audit --fetch-retries=5 \
+        --fetch-timeout=180000 --maxsockets=4 \
+        --registry=https://registry.npmmirror.com; do \
+      tries=$((tries+1)); \
+      { [ "$tries" -ge 6 ] && exit 1; echo "npm ci failed (attempt $tries); retrying in 20s"; sleep 20; }; \
+    done && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
@@ -283,7 +304,9 @@ RUN cd web && npm run build && \
 # node_modules + source (21s amd64 / 222s arm64 — #49113).  `a+rX,go-w`
 # gives the non-root hermes user read + traverse but no write; root retains
 # write so the build steps below don't need chmod u+w dances.
-COPY --link --chmod=a+rX,go-w . .
+COPY . .
+RUN chmod 0755 /opt/hermes/docker/*.sh /opt/hermes/docker/cont-init.d/* /opt/hermes/docker/s6-rc.d/*/run 2>/dev/null || true; \
+    chmod 0755 /opt/hermes/bin/* 2>/dev/null || true
 
 # ---------- Permissions ----------
 # Link hermes-agent itself (editable). Deps are already installed in the
@@ -353,8 +376,8 @@ RUN mkdir -p /etc/cont-init.d && \
     printf '#!/command/with-contenv sh\nexec /opt/hermes/docker/stage2-hook.sh\n' \
         > /etc/cont-init.d/01-hermes-setup && \
     chmod +x /etc/cont-init.d/01-hermes-setup
-COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
-COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+COPY docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
+COPY docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
@@ -403,8 +426,8 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # Recursion is impossible because the shim exec's the venv binary by
 # absolute path (/opt/hermes/.venv/bin/hermes). See the shim source for
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
-COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
-COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
+COPY docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+COPY docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
