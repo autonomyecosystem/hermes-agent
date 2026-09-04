@@ -1,4 +1,9 @@
 .DS_Store
+# Artefatti locali di build/debug: mai tracciati (furono committati per
+# errore nel tag v0.20.5, rimossi dall'indice; cfr. audit AES 2026-09-04).
+/log.txt
+/default.tar.gz
+*.tar.gz
 /venv/
 /venv.old/
 /venv.stale.runtime-*/
