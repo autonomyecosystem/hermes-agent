@@ -26,7 +26,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
@@ -338,6 +339,242 @@ class _FakeGoogleChatAdapter:
     async def dispatch_http_event(self, payload):
         self.dispatched.append(payload)
         return {"ok": True}
+
+
+@pytest.fixture
+def acc_notification_adapter(tmp_path):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "acc-test-key"}))
+    adapter._response_store.close()
+    adapter._response_store = ResponseStore(db_path=str(tmp_path / "receipts.db"))
+    home = HomeChannel(Platform.TELEGRAM, "-100123456", "Home", thread_id="17")
+    telegram = types.SimpleNamespace(
+        is_connected=True,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="123")),
+    )
+    adapter.gateway_runner = types.SimpleNamespace(
+        adapters={Platform.TELEGRAM: telegram},
+        config=GatewayConfig(platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, home_channel=home),
+        }),
+    )
+    yield adapter, telegram
+    adapter._response_store.close()
+
+
+class TestACCNotifications:
+    path = "/v1/acc/notifications"
+    headers = {"Authorization": "Bearer acc-test-key"}
+    body = {"event_id": "event-1", "text": "Notification"}
+
+    def client(self, adapter):
+        app = web.Application()
+        for method, path, handler in adapter._http_route_table():
+            app.router.add_route(method, path, handler)
+            app.router.add_route(method, "/p/{profile}" + path, handler)
+        return TestClient(TestServer(app))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("token", [None, "Bearer wrong", "Basic acc-test-key"])
+    async def test_auth_rejected(self, acc_notification_adapter, token):
+        adapter, telegram = acc_notification_adapter
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, json=self.body, headers={"Authorization": token} if token else {})
+            assert response.status == 401
+        telegram.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_key_fails_closed(self, acc_notification_adapter):
+        adapter, telegram = acc_notification_adapter
+        adapter._api_key = ""
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, json=self.body, headers=self.headers)
+            assert response.status == 401
+        telegram.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [
+        [], {}, {"event_id": "a"}, {"event_id": 1, "text": "a"},
+        {"event_id": " ", "text": "a"}, {"event_id": "a" * 129, "text": "a"},
+        {"event_id": "a", "text": ""}, {"event_id": "a", "text": " \n"},
+        {"event_id": "a", "text": 1}, {"event_id": "a", "text": "x" * 2001},
+        {"event_id": "a", "text": "\U00010000" * 1001},
+        {"event_id": "a", "text": "\ud800"},
+        {"event_id": "\ud800", "text": "a"},
+        {"event_id": "a", "text": "a", "chat_id": "attacker"},
+        {"event_id": "a", "text": "a", "destination": "telegram:other"},
+    ])
+    async def test_invalid_body(self, acc_notification_adapter, body):
+        adapter, telegram = acc_notification_adapter
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, json=body, headers=self.headers)
+            assert response.status == 400
+        telegram.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_malformed_json(self, acc_notification_adapter):
+        adapter, telegram = acc_notification_adapter
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, data="{", headers=self.headers)
+            assert response.status == 400
+        telegram.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", ["runner", "adapter", "home", "chat_id", "connected", "persistence", "profile", "draining"])
+    async def test_unavailable(self, acc_notification_adapter, missing, monkeypatch):
+        adapter, telegram = acc_notification_adapter
+        path = self.path
+        if missing == "runner":
+            adapter.gateway_runner = None
+        elif missing == "adapter":
+            adapter.gateway_runner.adapters.clear()
+        elif missing == "home":
+            adapter.gateway_runner.config.platforms[Platform.TELEGRAM].home_channel = None
+        elif missing == "chat_id":
+            adapter.gateway_runner.config.get_home_channel(Platform.TELEGRAM).chat_id = ""
+        elif missing == "connected":
+            telegram.is_connected = False
+        elif missing == "persistence":
+            adapter._response_store._db_path = None
+        elif missing == "profile":
+            path = "/p/other" + path
+        elif missing == "draining":
+            monkeypatch.setattr(adapter, "_gateway_is_draining", lambda: True)
+        async with self.client(adapter) as client:
+            response = await client.post(path, json=self.body, headers=self.headers)
+            assert response.status == 503
+        telegram.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_success_and_durable_replay(self, acc_notification_adapter):
+        adapter, telegram = acc_notification_adapter
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, json=self.body, headers=self.headers)
+            assert response.status == 200
+            assert await response.json() == {
+                "event_id": "event-1", "status": "sent", "message_id": "123", "replayed": False,
+            }
+            path = adapter._response_store._db_path
+            adapter._response_store.close()
+            adapter._response_store = ResponseStore(max_size=1, db_path=path)
+            adapter._response_store.put("other-1", {})
+            adapter._response_store.put("other-2", {})
+            response = await client.post(self.path, json=self.body, headers=self.headers)
+            assert response.status == 200
+            assert await response.json() == {
+                "event_id": "event-1", "status": "sent", "message_id": "123", "replayed": True,
+            }
+            response = await client.post(self.path, json={**self.body, "text": "changed"}, headers=self.headers)
+            assert response.status == 409
+            assert (await response.json())["error"]["code"] == "event_id_conflict"
+        telegram.send.assert_awaited_once_with(
+            chat_id="-100123456", content="Notification", metadata={"notify": True, "thread_id": "17"},
+        )
+        assert adapter._pending_agent_requests == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("result", [
+        SendResult(success=False, message_id="123", error="secret-details", retryable=True),
+        SendResult(success=True), SendResult(success=True, message_id=""),
+        SendResult(success=True, message_id="secret-details"),
+        SendResult(success=True, message_id="0"),
+        RuntimeError("secret-details"),
+    ])
+    async def test_unconfirmed_never_retried(self, acc_notification_adapter, result):
+        adapter, telegram = acc_notification_adapter
+        if isinstance(result, Exception):
+            telegram.send.side_effect = result
+        else:
+            telegram.send.return_value = result
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, json=self.body, headers=self.headers)
+            assert response.status == 502
+            assert await response.json() == {"error": {"code": "notification_unconfirmed"}}
+            path = adapter._response_store._db_path
+            adapter._response_store.close()
+            adapter._response_store = ResponseStore(db_path=path)
+            response = await client.post(self.path, json=self.body, headers=self.headers)
+            assert response.status == 409
+            assert await response.json() == {"error": {"code": "notification_unconfirmed"}}
+        telegram.send.assert_awaited_once()
+        assert adapter._pending_agent_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_connections_claim_once(self, acc_notification_adapter):
+        adapter, telegram = acc_notification_adapter
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def send(**kwargs):
+            started.set()
+            await release.wait()
+            return SendResult(success=True, message_id="123")
+
+        telegram.send.side_effect = send
+        other = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "acc-test-key"}))
+        other._response_store.close()
+        other._response_store = ResponseStore(db_path=adapter._response_store._db_path)
+        other.gateway_runner = adapter.gateway_runner
+        try:
+            async with self.client(adapter) as first, self.client(other) as second:
+                task = asyncio.create_task(first.post(self.path, json=self.body, headers=self.headers))
+                await asyncio.wait_for(started.wait(), 5)
+                try:
+                    assert adapter._pending_agent_requests == 1
+                    response = await second.post(self.path, json=self.body, headers=self.headers)
+                    assert response.status == 409
+                    assert await response.json() == {"error": {"code": "notification_unconfirmed"}}
+                finally:
+                    release.set()
+                    response = await task
+                assert response.status == 200
+                replay = await second.post(self.path, json=self.body, headers=self.headers)
+                assert replay.status == 200
+                assert (await replay.json())["replayed"] is True
+        finally:
+            other._response_store.close()
+        telegram.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", ["x" * 2000, "\U00010000" * 1000])
+    async def test_bounds_accepted(self, acc_notification_adapter, text):
+        adapter, telegram = acc_notification_adapter
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, json={"event_id": "x" * 128, "text": text}, headers=self.headers)
+            assert response.status == 200
+        telegram.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_send_blocks_retry(self, acc_notification_adapter):
+        adapter, telegram = acc_notification_adapter
+        started = asyncio.Event()
+
+        async def send(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        telegram.send.side_effect = send
+        request = MagicMock(headers=self.headers, match_info={})
+        request.json = AsyncMock(return_value=self.body)
+        task = asyncio.create_task(adapter._handle_acc_notification(request))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert adapter._pending_agent_requests == 0
+        response = await adapter._handle_acc_notification(request)
+        assert response.status == 409
+        telegram.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_receipt_write_failure_blocks_retry(self, acc_notification_adapter, monkeypatch):
+        adapter, telegram = acc_notification_adapter
+        monkeypatch.setattr(adapter._response_store, "confirm_acc_notification", MagicMock(side_effect=RuntimeError("secret-details")))
+        async with self.client(adapter) as client:
+            response = await client.post(self.path, json=self.body, headers=self.headers)
+            assert response.status == 502
+            assert await response.json() == {"error": {"code": "notification_unconfirmed"}}
+            response = await client.post(self.path, json=self.body, headers=self.headers)
+            assert response.status == 409
+        telegram.send.assert_awaited_once()
 
 
 @pytest.fixture

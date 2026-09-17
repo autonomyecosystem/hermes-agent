@@ -978,6 +978,36 @@ class ResponseStore:
         )
         self._conn.commit()
 
+    def claim_acc_notification(self, event_id: str, fingerprint: str) -> tuple:
+        if not self._db_path:
+            raise RuntimeError("Notification persistence unavailable")
+        with self._conn:
+            self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS acc_notifications (
+                    event_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    message_id TEXT
+                )"""
+            )
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO acc_notifications (event_id, fingerprint) VALUES (?, ?)",
+                (event_id, fingerprint),
+            )
+            row = self._conn.execute(
+                "SELECT fingerprint, message_id FROM acc_notifications WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return cursor.rowcount == 1, row[0], row[1]
+
+    def confirm_acc_notification(self, event_id: str, message_id: str) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE acc_notifications SET message_id = ? WHERE event_id = ? AND message_id IS NULL",
+                (message_id, event_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Notification confirmation unavailable")
+
     def close(self) -> None:
         """Close the database connection."""
         try:
@@ -1842,6 +1872,92 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    async def _handle_acc_notification(self, request: "web.Request") -> "web.Response":
+        if not self._expected_api_key():
+            return web.json_response({"error": {"code": "gateway_auth_failed"}}, status=401)
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        if request.match_info.get("profile") or _api_request_profile.get() not in (None, "default"):
+            return web.json_response({"error": {"code": "notification_unavailable"}}, status=503)
+
+        try:
+            body = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            return web.json_response({"error": {"code": "invalid_notification"}}, status=413)
+        except (ValueError, UnicodeError):
+            return web.json_response({"error": {"code": "invalid_notification"}}, status=400)
+        if not isinstance(body, dict) or set(body) != {"event_id", "text"}:
+            return web.json_response({"error": {"code": "invalid_notification"}}, status=400)
+        event_id, text = body["event_id"], body["text"]
+        if (
+            not isinstance(event_id, str)
+            or not 1 <= len(event_id) <= 128
+            or not event_id.strip()
+            or not isinstance(text, str)
+            or not text.strip()
+            or len(text) > 2000
+        ):
+            return web.json_response({"error": {"code": "invalid_notification"}}, status=400)
+        try:
+            if len(text.encode("utf-16-le")) > 4000:
+                raise ValueError
+            fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            event_id.encode("utf-8")
+        except (ValueError, UnicodeError):
+            return web.json_response({"error": {"code": "invalid_notification"}}, status=400)
+
+        runner = self.gateway_runner
+        telegram = runner.adapters.get(Platform.TELEGRAM) if runner else None
+        home = runner.config.get_home_channel(Platform.TELEGRAM) if runner else None
+        if (
+            telegram is None
+            or not telegram.is_connected
+            or home is None
+            or home.platform != Platform.TELEGRAM
+            or not str(home.chat_id or "").strip()
+        ):
+            return web.json_response({"error": {"code": "notification_unavailable"}}, status=503)
+        draining = self._draining_response()
+        if draining is not None:
+            return draining
+        try:
+            claimed, previous_fingerprint, message_id = self._response_store.claim_acc_notification(
+                event_id, fingerprint
+            )
+        except Exception:
+            return web.json_response({"error": {"code": "notification_unavailable"}}, status=503)
+        if previous_fingerprint != fingerprint:
+            return web.json_response({"error": {"code": "event_id_conflict"}}, status=409)
+        if not claimed:
+            if message_id is None:
+                return web.json_response({"error": {"code": "notification_unconfirmed"}}, status=409)
+            return web.json_response({
+                "event_id": event_id, "status": "sent", "message_id": message_id, "replayed": True,
+            })
+
+        metadata: Dict[str, Any] = {"notify": True}
+        if home.thread_id:
+            metadata["thread_id"] = home.thread_id
+        self._pending_agent_requests += 1
+        try:
+            result = await telegram.send(chat_id=home.chat_id, content=text, metadata=metadata)
+            message_id = result.message_id
+            if (
+                result.success is not True
+                or not isinstance(message_id, str)
+                or re.fullmatch(r"[1-9][0-9]{0,19}", message_id) is None
+            ):
+                return web.json_response({"error": {"code": "notification_unconfirmed"}}, status=502)
+            self._response_store.confirm_acc_notification(event_id, message_id)
+        except Exception:
+            return web.json_response({"error": {"code": "notification_unconfirmed"}}, status=502)
+        finally:
+            self._pending_agent_requests -= 1
+        return web.json_response({
+            "event_id": event_id, "status": "sent", "message_id": message_id, "replayed": False,
+        })
+
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
@@ -2083,6 +2199,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/v1/acc/notifications", self._handle_acc_notification),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
